@@ -1,0 +1,62 @@
+services:
+  backend:
+    # Platform removed for faster local development
+    # Add 'platform: linux/amd64' here for production Linux deployment
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: ppc-tuner-backend
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    ports:
+      - "8001:8000"  # Host:Container - no conflict with viteReg (8000:8000)
+    environment:
+      - DSA_BASE_URL=${DSA_BASE_URL:-http://bdsa.pathology.emory.edu:8080/api/v1}
+      - DSAKEY=${DSAKEY:-}
+      - DSA_START_FOLDER=${DSA_START_FOLDER:-695d6a148c871f3a02969b00}
+      - DSA_START_FOLDERTYPE=${DSA_START_FOLDERTYPE:-collection}
+      - CACHE_DIR=/app/.npCacheDir
+    volumes:
+      - ./backend:/app
+      - backend-cache:/app/.npCacheDir
+    networks:
+      - ppc-tuner-network
+    restart: unless-stopped
+
+  frontend:
+    # Platform removed for faster local development
+    # Add 'platform: linux/amd64' here for production Linux deployment
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: ppc-tuner-frontend
+    # Nginx runs as root to bind to port 80 internally (container port)
+    # Host port 8080 avoids conflict with viteReg which uses host port 80
+    # For mounted volumes, files will be created with host user permissions
+    ports:
+      - "8080:80"  # Host:Container - no conflict with viteReg (80:80)
+    depends_on:
+      - backend
+    volumes:
+      # For development: mount source code for hot reload
+      - ./src:/app/src:ro
+      - ./public:/app/public:ro
+      - ./index.html:/app/index.html:ro
+      - ./vite.config.ts:/app/vite.config.ts:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./package.json:/app/package.json:ro
+    networks:
+      - ppc-tuner-network
+    restart: unless-stopped
+
+volumes:
+  backend-cache:
+
+networks:
+  ppc-tuner-network:
+    driver: bridge
