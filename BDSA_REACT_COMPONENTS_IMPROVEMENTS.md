@@ -370,6 +370,68 @@ function AppContent() {
 
 ---
 
+## 12. SlideViewer Viewport Coordinates Callback
+
+### Current State
+- `SlideViewer` component wraps OpenSeadragon but does not expose viewport coordinates
+- Applications must access OpenSeadragon's global registry or DOM to get viewport bounds
+- This is fragile and requires knowledge of OpenSeadragon internals
+
+### Proposed Enhancement
+Add `onViewportChange` callback prop to `SlideViewer` that fires whenever the viewport changes (pan, zoom, resize):
+
+```tsx
+<SlideViewer
+  imageInfo={{ dziUrl: '...' }}
+  height="600px"
+  onViewportChange={(bounds) => {
+    // bounds: { x: number, y: number, width: number, height: number, zoom: number }
+    // Coordinates are normalized (0-1) relative to full image
+    console.log('Viewport:', bounds)
+    setViewportState(bounds)
+  }}
+/>
+```
+
+**Callback signature:**
+```tsx
+type ViewportBounds = {
+  x: number        // Left edge (0-1, normalized)
+  y: number        // Top edge (0-1, normalized)
+  width: number    // Width (0-1, normalized)
+  height: number   // Height (0-1, normalized)
+  zoom: number     // Current zoom level (e.g., 1.0 = 100%)
+}
+
+onViewportChange?: (bounds: ViewportBounds) => void
+```
+
+**Implementation Notes:**
+- Fire callback on OpenSeadragon events: `animation`, `pan`, `zoom`, `resize`
+- Debounce rapid updates (e.g., during animations) to avoid excessive callbacks
+- Provide normalized coordinates (0-1) for consistency across different image sizes
+- Include zoom level for convenience
+- Fire callback immediately after viewer initialization with initial viewport state
+
+**Benefits:**
+- Clean API - no need to access OpenSeadragon internals
+- Consistent coordinate system (normalized 0-1)
+- Enables features like:
+  - Viewport coordinate displays
+  - Region capture/cropping
+  - Viewport-based annotations
+  - Viewport history/undo-redo
+  - Viewport sharing/bookmarking
+
+**Example Use Cases:**
+- Display current viewport coordinates in UI
+- Capture a region of the image based on current viewport
+- Save/restore viewport state
+- Sync viewport across multiple viewers
+- Generate viewport-based annotations
+
+---
+
 **Generated:** 2025-01-09  
 **Based on:** PPC Tuner V2 implementation experience  
 **Status:** Suggestions for library maintainers

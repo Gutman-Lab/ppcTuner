@@ -41,9 +41,60 @@ async def list_images(folder_id: Optional[str] = None):
 
 @router.get("/{image_id}")
 async def get_image_info(image_id: str):
-    """Get image information"""
-    # TODO: Implement DSA client integration
-    return {"id": image_id, "name": "Sample Image"}
+    """Get image information including dimensions from DSA tiles endpoint"""
+    try:
+        dsa_client = get_dsa_client()
+        if not dsa_client or not dsa_client.client:
+            raise HTTPException(
+                status_code=500,
+                detail="DSA client not available"
+            )
+        
+        # Get item info
+        try:
+            item_info = dsa_client.client.getItem(image_id)
+        except Exception as e:
+            logger.error(f"Failed to get item info for {image_id}: {e}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Item not found: {image_id}"
+            )
+        
+        # Get image dimensions from tiles endpoint
+        # DSA tiles endpoint returns metadata including sizeX and sizeY
+        try:
+            tiles_info = dsa_client.client.get(f"item/{image_id}/tiles")
+            width = tiles_info.get('sizeX') or tiles_info.get('width')
+            height = tiles_info.get('sizeY') or tiles_info.get('height')
+        except Exception as e:
+            logger.warning(f"Could not get tiles info for {image_id}: {e}, trying DZI descriptor")
+            # Fallback: try to parse DZI XML
+            try:
+                dzi_response = dsa_client.client.get(f"item/{image_id}/tiles/dzi.dzi", jsonResp=False)
+                # DZI XML format: <Image ... Width="..." Height="...">
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(dzi_response.content)
+                width = int(root.get('Width', 0))
+                height = int(root.get('Height', 0))
+            except Exception as e2:
+                logger.error(f"Could not get dimensions from DZI for {image_id}: {e2}")
+                width = None
+                height = None
+        
+        return {
+            "id": image_id,
+            "name": item_info.get('name', 'Unknown'),
+            "width": width,
+            "height": height
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error getting image info for {image_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
 
 
 @router.get("/{image_id}/thumbnail")
@@ -178,6 +229,109 @@ async def get_tissue_mask(
         )
     except Exception as e:
         logger.error(f"Unexpected error generating mask for {image_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+@router.get("/{image_id}/region")
+async def get_image_region(
+    image_id: str,
+    x: float = Query(..., ge=0.0, le=1.0, description="Left edge of region (0-1, normalized)"),
+    y: float = Query(..., ge=0.0, le=1.0, description="Top edge of region (0-1, normalized)"),
+    width: float = Query(..., ge=0.0, le=1.0, description="Width of region (0-1, normalized)"),
+    height: float = Query(..., ge=0.0, le=1.0, description="Height of region (0-1, normalized)"),
+    output_width: int = Query(1024, ge=256, le=4096, description="Output image width in pixels")
+):
+    """
+    Get a cropped region of the image based on normalized coordinates (0-1).
+    
+    Uses DSA's /item/{id}/tiles/region endpoint via girder_client.
+    Coordinates are normalized to the full image dimensions (fraction units):
+    - (0, 0) = top-left corner
+    - (1, 1) = bottom-right corner
+    
+    The region is fetched directly from DSA at the appropriate resolution level
+    and scaled to the requested output_width (aspect ratio preserved).
+    """
+    try:
+        dsa_client = get_dsa_client()
+        if not dsa_client or not dsa_client.client:
+            raise HTTPException(
+                status_code=500,
+                detail="DSA client not available"
+            )
+        
+        # Use girder_client to fetch region directly from DSA
+        # DSA region endpoint: /item/{id}/tiles/region
+        # See: https://girder.readthedocs.io/en/latest/api-docs.html#get-item-itemid-tiles-region
+        # 
+        # Parameters:
+        #   - left, top: coordinates (0-based, can use fraction 0-1)
+        #   - regionWidth, regionHeight: size (can use fraction 0-1)
+        #   - units: 'fraction' (0-1), 'base_pixels', 'pixels', 'mm'
+        #   - width, height: output dimensions in pixels (max width/height, aspect ratio preserved)
+        #   - encoding: 'JPEG', 'PNG', 'TILED', 'Pickle'
+        #   - jpegQuality: 0-100
+        #   - exact: boolean (if magnification/mm specified, must match exactly)
+        
+        region_url = f"item/{image_id}/tiles/region"
+        
+        # Build parameters for region request
+        # Use 'fraction' units (0-1) which is what OpenSeadragon provides via getBounds()
+        params = {
+            'left': x,
+            'top': y,
+            'regionWidth': width,
+            'regionHeight': height,
+            'units': 'fraction',  # Use fraction (0-1) for normalized coordinates
+            'encoding': 'PNG',  # Use PNG for better quality (no compression artifacts)
+        }
+        
+        # If output_width is specified, set the maximum output width
+        # DSA will automatically preserve aspect ratio (may be smaller in one dimension)
+        if output_width:
+            params['width'] = output_width
+            # Note: We don't specify height - DSA preserves aspect ratio automatically
+            # If both width and height are specified, the image may be smaller in one dimension
+        
+        # Fetch region using girder_client
+        # Use jsonResp=False to get binary image data
+        try:
+            region_response = dsa_client.client.get(region_url, parameters=params, jsonResp=False)
+            image_data = region_response.content
+            
+            # Determine content type from response headers
+            content_type = region_response.headers.get('Content-Type', 'image/png')
+            
+            return Response(
+                content=image_data,
+                media_type=content_type,
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch region from DSA for {image_id}: {e}")
+            # Check if it's a 404 or other specific error
+            if hasattr(e, 'status') and e.status == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Item or region not found: {image_id}"
+                )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch region from DSA: {str(e)}"
+            )
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch image for region extraction {image_id}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch image from DSA: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error extracting region for {image_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {str(e)}"

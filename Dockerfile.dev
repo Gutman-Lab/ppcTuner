@@ -7,8 +7,13 @@ FROM node:20-alpine
 ARG USER_ID=1000
 ARG GROUP_ID=1000
 
-# Install git (needed for GitHub dependencies like osd-paperjs-annotation)
-RUN apk add --no-cache git
+# Install git and gosu (needed for GitHub dependencies and user switching)
+# gosu is more reliable than su-exec for switching users
+RUN apk add --no-cache git && \
+    apk add --no-cache --virtual .gosu-deps curl && \
+    curl -L https://github.com/tianon/gosu/releases/download/1.17/gosu-amd64 -o /usr/local/bin/gosu && \
+    chmod +x /usr/local/bin/gosu && \
+    apk del .gosu-deps
 
 WORKDIR /app
 
@@ -22,13 +27,23 @@ RUN npm install
 # Do this AFTER npm install since npm needs root to install packages
 RUN addgroup -g ${GROUP_ID} appuser || true && \
     adduser -u ${USER_ID} -G appuser -D -s /bin/sh appuser || true && \
-    chown -R ${USER_ID}:${GROUP_ID} /app
+    mkdir -p /app/node_modules/.vite-temp && \
+    chown -R ${USER_ID}:${GROUP_ID} /app && \
+    chmod -R u+w /app/node_modules  # Ensure appuser can write to node_modules (for Vite temp files)
 
-# Switch to appuser
-USER appuser
+# Copy entrypoint script
+COPY docker-entrypoint-dev.sh /usr/local/bin/docker-entrypoint-dev.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-dev.sh
+
+# Keep as root for entrypoint to fix permissions
+# Docker-compose will switch to appuser via user directive
+# USER appuser  # Commented out - docker-compose handles user switching
 
 # Expose Vite dev server port
 EXPOSE 5173
+
+# Use entrypoint script to fix permissions on startup
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-dev.sh"]
 
 # Start dev server with watch mode
 # The actual command will be overridden by docker-compose.dev.yml

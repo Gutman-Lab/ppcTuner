@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 import logging
-from app.services.ppc_service import compute_ppc, auto_threshold_ppc, auto_detect_hue_parameters, get_ppc_label_image, get_positive_pixel_intensities, memory
+from app.services.ppc_service import compute_ppc, compute_ppc_region, auto_threshold_ppc, auto_detect_hue_parameters, get_ppc_label_image, get_ppc_label_image_region, get_positive_pixel_intensities, memory
 from fastapi.responses import Response
 from app.core.config import settings
 
@@ -317,6 +317,153 @@ async def get_label_image(
     except Exception as e:
         logger.error(f"Label image generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Label image generation failed: {str(e)}")
+
+
+@router.get("/compute-region", response_model=PPCResponse)
+async def compute_ppc_region_endpoint(
+    item_id: str = Query(..., description="DSA item ID"),
+    x: float = Query(..., ge=0.0, le=1.0, description="Left edge of region (0-1, normalized)"),
+    y: float = Query(..., ge=0.0, le=1.0, description="Top edge of region (0-1, normalized)"),
+    width: float = Query(..., ge=0.0, le=1.0, description="Width of region (0-1, normalized)"),
+    height: float = Query(..., ge=0.0, le=1.0, description="Height of region (0-1, normalized)"),
+    output_width: int = Query(1024, ge=256, le=4096, description="Output image width in pixels"),
+    # HSI parameters
+    hue_value: float = Query(0.1, ge=0.0, le=1.0, description="Center hue for positive color (HSI method)"),
+    hue_width: float = Query(0.1, ge=0.0, le=1.0, description="Width of hue range (HSI method)"),
+    saturation_minimum: float = Query(0.1, ge=0.0, le=1.0, description="Minimum saturation (HSI method)"),
+    intensity_upper_limit: float = Query(0.9, ge=0.0, le=1.0, description="Intensity upper limit (HSI method)"),
+    intensity_weak_threshold: float = Query(0.6, ge=0.0, le=1.0, description="Intensity weak threshold (HSI method)"),
+    intensity_strong_threshold: float = Query(0.3, ge=0.0, le=1.0, description="Intensity strong threshold (HSI method)"),
+    intensity_lower_limit: float = Query(0.05, ge=0.0, le=1.0, description="Intensity lower limit (HSI method)")
+):
+    """
+    Compute Positive Pixel Count (PPC) for a specific region of an image.
+    
+    Similar to /compute but works on a cropped region instead of the full thumbnail.
+    This allows analyzing specific areas at higher magnification or different FOV.
+    The region is fetched from DSA at the requested resolution.
+    
+    Results are computed on the region image (similar format to thumbnail).
+    """
+    try:
+        result = compute_ppc_region(
+            item_id=item_id,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            output_width=output_width,
+            method="hsi",
+            hue_value=hue_value,
+            hue_width=hue_width,
+            saturation_minimum=saturation_minimum,
+            intensity_upper_limit=intensity_upper_limit,
+            intensity_weak_threshold=intensity_weak_threshold,
+            intensity_strong_threshold=intensity_strong_threshold,
+            intensity_lower_limit=intensity_lower_limit,
+        )
+        return PPCResponse(**result)
+    except ValueError as e:
+        logger.error(f"PPC region computation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"PPC region computation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"PPC region computation failed: {str(e)}")
+
+
+@router.get("/label-image-region", response_class=Response)
+async def get_label_image_region(
+    item_id: str = Query(..., description="DSA item ID"),
+    x: float = Query(..., ge=0.0, le=1.0, description="Left edge of region (0-1, normalized)"),
+    y: float = Query(..., ge=0.0, le=1.0, description="Top edge of region (0-1, normalized)"),
+    width: float = Query(..., ge=0.0, le=1.0, description="Width of region (0-1, normalized)"),
+    height: float = Query(..., ge=0.0, le=1.0, description="Height of region (0-1, normalized)"),
+    output_width: int = Query(1024, ge=256, le=4096, description="Output image width in pixels"),
+    method: str = Query("hsi", description="PPC method (only 'hsi' supported for label images)"),
+    # HSI parameters
+    hue_value: float = Query(0.1, ge=0.0, le=1.0, description="Center hue (HSI method)"),
+    hue_width: float = Query(0.1, ge=0.0, le=1.0, description="Hue width (HSI method)"),
+    saturation_minimum: float = Query(0.1, ge=0.0, le=1.0, description="Min saturation (HSI method)"),
+    intensity_upper_limit: float = Query(0.9, ge=0.0, le=1.0, description="Intensity upper limit (HSI method)"),
+    intensity_weak_threshold: float = Query(0.6, ge=0.0, le=1.0, description="Intensity weak threshold (HSI method)"),
+    intensity_strong_threshold: float = Query(0.3, ge=0.0, le=1.0, description="Intensity strong threshold (HSI method)"),
+    intensity_lower_limit: float = Query(0.05, ge=0.0, le=1.0, description="Intensity lower limit (HSI method)"),
+    show_weak: bool = Query(True, description="Show weak positive pixels"),
+    show_plain: bool = Query(True, description="Show plain positive pixels"),
+    show_strong: bool = Query(True, description="Show strong positive pixels"),
+    color_scheme: str = Query("blue-green-red", description="Color scheme: 'blue-green-red' or 'yellow-orange-red'")
+):
+    """
+    Get PPC label image for a specific region of an image.
+    
+    Similar to /label-image but works on a cropped region instead of the full thumbnail.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+        from io import BytesIO
+        
+        label_image = get_ppc_label_image_region(
+            item_id=item_id,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            output_width=output_width,
+            method=method,
+            hue_value=hue_value,
+            hue_width=hue_width,
+            saturation_minimum=saturation_minimum,
+            intensity_upper_limit=intensity_upper_limit,
+            intensity_weak_threshold=intensity_weak_threshold,
+            intensity_strong_threshold=intensity_strong_threshold,
+            intensity_lower_limit=intensity_lower_limit,
+        )
+        
+        if label_image is None:
+            raise HTTPException(status_code=400, detail="Label images only supported for HSI method")
+        
+        # Convert label image to colored visualization
+        height_img, width_img = label_image.shape
+        colored = np.zeros((height_img, width_img, 3), dtype=np.uint8)
+        
+        # Apply color scheme
+        if color_scheme == "yellow-orange-red":
+            # Yellow for weak (1), Orange for plain (2), Red for strong (3)
+            if show_weak:
+                colored[label_image == 1] = [255, 255, 0]  # Yellow
+            if show_plain:
+                colored[label_image == 2] = [255, 165, 0]  # Orange
+            if show_strong:
+                colored[label_image == 3] = [255, 0, 0]  # Red
+        else:  # blue-green-red (default)
+            # Blue for weak (1), Green for plain (2), Red for strong (3)
+            if show_weak:
+                colored[label_image == 1] = [0, 0, 255]  # Blue
+            if show_plain:
+                colored[label_image == 2] = [0, 255, 0]  # Green
+            if show_strong:
+                colored[label_image == 3] = [255, 0, 0]  # Red
+        
+        # Convert to PIL Image and then to PNG bytes
+        img = Image.fromarray(colored)
+        img_bytes = BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        
+        return Response(
+            content=img_bytes.getvalue(),
+            media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+            }
+        )
+    except ValueError as e:
+        logger.error(f"Label image region error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Label image region generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Label image region generation failed: {str(e)}")
 
 
 @router.get("/intensity-map")

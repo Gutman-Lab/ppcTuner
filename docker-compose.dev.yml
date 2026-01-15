@@ -30,7 +30,8 @@ services:
       args:
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    # user directive removed - entrypoint handles user switching after fixing permissions
+    # user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
     ports:
       - "5174:5173"
     volumes:

@@ -25,21 +25,46 @@
 
 .app-main {
   padding: 2rem;
-  max-width: 1400px;
+  max-width: 100%;
   margin: 0 auto;
 }
 
-.browser-section,
+.browser-section {
+  background-color: white;
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 2rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  max-width: 500px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 .thumbnail-section {
   background-color: white;
   border-radius: 8px;
   padding: 1.5rem;
   margin-bottom: 2rem;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  width: 100%;
 }
 
 .browser-section h2,
 .thumbnail-section h2 {
+  margin: 0 0 1rem 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #2c3e50;
+  border-bottom: 2px solid #3498db;
+  padding-bottom: 0.5rem;
+}
+
+.image-viewer-section {
+  width: 100%;
+  margin-top: 2rem;
+}
+
+.image-viewer-section h2 {
   margin: 0 0 1rem 0;
   font-size: 1.25rem;
   font-weight: 600;

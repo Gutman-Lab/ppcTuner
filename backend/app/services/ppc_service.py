@@ -3,14 +3,14 @@ PPC (Positive Pixel Count) service with caching
 """
 import numpy as np
 import logging
-import requests
 import os
 import time
-from io import BytesIO
-from PIL import Image
 from typing import Dict, Any, Optional
 from joblib import Memory
 from app.services.dsa_client import DSAClient
+from app.services.image_fetching import get_thumbnail_image, get_region_image, get_dsa_client, _fetch_thumbnail_uncached
+from app.services.color_analysis import rgb_to_hsi
+from app.core.config import settings
 
 # Try to import psutil for CPU metrics (optional)
 try:
@@ -20,18 +20,6 @@ except ImportError:
     HAS_PSUTIL = False
     psutil = None
 
-# Global DSA client instance (initialized on first use)
-_dsa_client: Optional[DSAClient] = None
-
-
-def get_dsa_client() -> DSAClient:
-    """Get or create DSA client instance"""
-    global _dsa_client
-    if _dsa_client is None:
-        _dsa_client = DSAClient()
-    return _dsa_client
-from app.core.config import settings
-
 logger = logging.getLogger(__name__)
 
 # Initialize joblib Memory cache for numpy arrays
@@ -39,32 +27,6 @@ logger = logging.getLogger(__name__)
 cache_dir = settings.CACHE_DIR
 os.makedirs(cache_dir, exist_ok=True)
 memory = Memory(cache_dir, verbose=0)
-
-
-@memory.cache
-def _fetch_thumbnail_uncached(item_id: str, width: int, token: str) -> Optional[np.ndarray]:
-    """Internal cached function to fetch thumbnail (token is part of cache key)"""
-    base_url = settings.DSA_BASE_URL.rstrip('/api/v1')
-    url = f"{base_url}/api/v1/item/{item_id}/tiles/thumbnail?width={width}"
-    if token:
-        url += f"&token={token}"
-    
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        img = Image.open(BytesIO(response.content))
-        return np.array(img)
-    except Exception as e:
-        logger.error(f"Failed to get thumbnail for {item_id}: {e}")
-        return None
-
-
-def get_thumbnail_image(item_id: str, width: int = 1024, dsa_client: Optional[DSAClient] = None) -> Optional[np.ndarray]:
-    """Fetch thumbnail image from DSA and return as numpy array (cached)"""
-    if dsa_client is None:
-        dsa_client = get_dsa_client()
-    token = dsa_client.get_token() or ""
-    return _fetch_thumbnail_uncached(item_id, width, token)
 
 
 def _get_cpu_metrics() -> Dict[str, float]:
@@ -83,66 +45,239 @@ def _get_cpu_metrics() -> Dict[str, float]:
     return {"cpu_percent": 0.0, "memory_mb": 0.0}
 
 
-def rgb_to_hsi(rgb: np.ndarray) -> np.ndarray:
+# rgb_to_hsi is now imported from color_analysis
+
+
+def _analyze_ppc_hsi(
+    img: np.ndarray,
+    item_id: str,
+    hue_value: float,
+    hue_width: float,
+    saturation_minimum: float,
+    intensity_upper_limit: float,
+    intensity_weak_threshold: float,
+    intensity_strong_threshold: float,
+    intensity_lower_limit: float,
+    extra_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Convert RGB image to HSI (Hue, Saturation, Intensity) color space.
+    Common PPC analysis logic for HSI method.
     
-    Optimized vectorized implementation - no loops, minimal memory copies.
-    Based on HistomicsTK's color conversion.
+    This function performs the actual PPC computation on an image array.
+    It's used by both thumbnail and region analysis - only the image fetch differs.
     
     Args:
-        rgb: RGB image array, shape (H, W, 3), values in [0, 1]
+        img: Image array (numpy array, can be uint8 or float32)
+        item_id: DSA item ID (for result metadata)
+        hue_value: Center hue for positive color (0-1)
+        hue_width: Width of hue range (0-1)
+        saturation_minimum: Minimum saturation (0-1)
+        intensity_upper_limit: Intensity above which pixel is negative (0-1)
+        intensity_weak_threshold: Intensity threshold for weak vs plain (0-1)
+        intensity_strong_threshold: Intensity threshold for plain vs strong (0-1)
+        intensity_lower_limit: Intensity below which pixel is negative (0-1)
+        extra_params: Optional dict to merge into parameters (e.g., region coordinates)
     
     Returns:
-        HSI image array, shape (H, W, 3), values in [0, 1]
-        Channels: [Hue, Saturation, Intensity]
+        Dictionary with PPC results
     """
-    # Ensure input is float32 for efficiency
-    if rgb.dtype != np.float32:
-        rgb = rgb.astype(np.float32)
+    start_time = time.time()
+    cpu_start = _get_cpu_metrics()
     
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    
-    # Intensity (I) = average of RGB
-    intensity = (r + g + b) / 3.0
-    
-    # Avoid division by zero for black pixels
-    eps = 1e-6
-    total = r + g + b + eps
-    
-    # Normalized RGB
-    r_norm = r / total
-    g_norm = g / total
-    b_norm = b / total
-    
-    # Saturation calculation
-    # S = 1 - 3 * min(R, G, B) / (R + G + B)
-    min_rgb = np.minimum(np.minimum(r_norm, g_norm), b_norm)
-    saturation = 1.0 - 3.0 * min_rgb
-    
-    # Hue calculation (handles wraparound at 0/360 degrees)
-    # H = arccos((0.5 * ((R - G) + (R - B))) / sqrt((R - G)^2 + (R - B)(G - B)))
-    numerator = 0.5 * ((r_norm - g_norm) + (r_norm - b_norm))
-    denominator = np.sqrt((r_norm - g_norm) ** 2 + (r_norm - b_norm) * (g_norm - b_norm)) + eps
-    
-    # Clamp to [-1, 1] for arccos
-    cos_h = np.clip(numerator / denominator, -1.0, 1.0)
-    hue = np.arccos(cos_h)
-    
-    # Adjust hue based on blue component
-    # If B > G, hue = 2π - hue (wraparound)
-    hue = np.where(b_norm > g_norm, 2.0 * np.pi - hue, hue)
-    
-    # Normalize hue to [0, 1] range (divide by 2π)
-    hue = hue / (2.0 * np.pi)
-    
-    # Ensure saturation is in [0, 1]
-    saturation = np.clip(saturation, 0.0, 1.0)
-    
-    # Stack into HSI array (no copy, just view manipulation)
-    hsi = np.stack([hue, saturation, intensity], axis=-1)
-    
-    return hsi
+    try:
+        # Convert to RGB if needed (in-place view when possible)
+        if len(img.shape) == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]  # View, not copy
+        
+        # Normalize to 0-1 range (single conversion)
+        if img.dtype == np.uint8:
+            img = (img.astype(np.float32) / 255.0)
+        else:
+            img = img.astype(np.float32)
+        
+        img = np.clip(img, 0.0, 1.0)
+        
+        # Convert RGB to HSI (vectorized, optimized)
+        hsi = rgb_to_hsi(img)
+        h, s, i = hsi[..., 0], hsi[..., 1], hsi[..., 2]
+        
+        # Background mask (exclude very bright pixels)
+        background_threshold = 0.94
+        background_mask = (img[..., 0] > background_threshold) & \
+                          (img[..., 1] > background_threshold) & \
+                          (img[..., 2] > background_threshold)
+        tissue_mask = ~background_mask
+        
+        # Apply tissue mask to HSI channels (use views, not copies)
+        h_tissue = h[tissue_mask]
+        s_tissue = s[tissue_mask]
+        i_tissue = i[tissue_mask]
+        
+        if len(h_tissue) == 0:
+            # No tissue found
+            total_pixels = img.shape[0] * img.shape[1]
+            params = {
+                "hue_value": hue_value,
+                "hue_width": hue_width,
+                "saturation_minimum": saturation_minimum,
+                "intensity_upper_limit": intensity_upper_limit,
+                "intensity_weak_threshold": intensity_weak_threshold,
+                "intensity_strong_threshold": intensity_strong_threshold,
+                "intensity_lower_limit": intensity_lower_limit,
+            }
+            if extra_params:
+                params.update(extra_params)
+            return {
+                "item_id": item_id,
+                "total_pixels": total_pixels,
+                "tissue_pixels": 0,
+                "background_pixels": int(np.sum(background_mask)),
+                "weak_positive_pixels": 0,
+                "plain_positive_pixels": 0,
+                "strong_positive_pixels": 0,
+                "total_positive_pixels": 0,
+                "weak_percentage": 0.0,
+                "plain_percentage": 0.0,
+                "strong_percentage": 0.0,
+                "positive_percentage": 0.0,
+                "method": "hsi",
+                "parameters": params,
+                "metrics": {
+                    "execution_time_seconds": round(time.time() - start_time, 4),
+                    "cpu_percent": 0.0,
+                    "memory_mb": _get_cpu_metrics()["memory_mb"],
+                }
+            }
+        
+        # Positive pixel detection (vectorized, optimized)
+        # Check hue range with wraparound (0.5 is center, so we check distance from hue_value)
+        # HistomicsTK uses: abs(((hue - hue_value + 0.5) % 1) - 0.5) <= hue_width / 2
+        hue_diff = ((h_tissue - hue_value + 0.5) % 1.0) - 0.5
+        hue_in_range = np.abs(hue_diff) <= (hue_width / 2.0)
+        
+        # Check saturation and intensity bounds
+        saturation_ok = s_tissue >= saturation_minimum
+        intensity_ok = (i_tissue < intensity_upper_limit) & (i_tissue >= intensity_lower_limit)
+        
+        # All positive pixels (meet all criteria)
+        mask_all_positive = hue_in_range & saturation_ok & intensity_ok
+        
+        # Get intensities of positive pixels only (for classification)
+        positive_intensities = i_tissue[mask_all_positive]
+        
+        if len(positive_intensities) == 0:
+            # No positive pixels found
+            total_tissue_pixels = int(np.sum(tissue_mask))
+            total_pixels = img.shape[0] * img.shape[1]
+            params = {
+                "hue_value": hue_value,
+                "hue_width": hue_width,
+                "saturation_minimum": saturation_minimum,
+                "intensity_upper_limit": intensity_upper_limit,
+                "intensity_weak_threshold": intensity_weak_threshold,
+                "intensity_strong_threshold": intensity_strong_threshold,
+                "intensity_lower_limit": intensity_lower_limit,
+            }
+            if extra_params:
+                params.update(extra_params)
+            return {
+                "item_id": item_id,
+                "total_pixels": total_pixels,
+                "tissue_pixels": total_tissue_pixels,
+                "background_pixels": int(np.sum(background_mask)),
+                "weak_positive_pixels": 0,
+                "plain_positive_pixels": 0,
+                "strong_positive_pixels": 0,
+                "total_positive_pixels": 0,
+                "weak_percentage": 0.0,
+                "plain_percentage": 0.0,
+                "strong_percentage": 0.0,
+                "positive_percentage": 0.0,
+                "method": "hsi",
+                "parameters": params,
+                "metrics": {
+                    "execution_time_seconds": round(time.time() - start_time, 4),
+                    "cpu_percent": 0.0,
+                    "memory_mb": _get_cpu_metrics()["memory_mb"],
+                }
+            }
+        
+        # Classify positive pixels into weak, plain, strong based on intensity
+        # 
+        # IMPORTANT: In HSI color space, "intensity" refers to pixel BRIGHTNESS (0=dark, 1=bright).
+        # This is the opposite of "staining intensity"!
+        #
+        # For IHC staining (DAB/brown):
+        #   - Strong staining = lots of DAB = dark brown = LOW pixel intensity (closer to 0)
+        #   - Weak staining = little DAB = light brown = HIGH pixel intensity (closer to 1)
+        #   - Negative = white background = VERY HIGH pixel intensity (close to 1)
+        #
+        # Classification:
+        #   Weak: intensity >= intensity_weak_threshold (light brown, high pixel brightness)
+        #   Strong: intensity < intensity_strong_threshold (dark brown, low pixel brightness)
+        #   Plain: intensity_strong_threshold <= intensity < intensity_weak_threshold (medium brown)
+        mask_weak = positive_intensities >= intensity_weak_threshold
+        mask_strong = positive_intensities < intensity_strong_threshold
+        mask_plain = ~(mask_weak | mask_strong)
+        
+        # Count pixels
+        weak_count = int(np.sum(mask_weak))
+        plain_count = int(np.sum(mask_plain))
+        strong_count = int(np.sum(mask_strong))
+        total_positive = weak_count + plain_count + strong_count
+        
+        # Calculate percentages
+        total_tissue_pixels = int(np.sum(tissue_mask))
+        total_pixels = img.shape[0] * img.shape[1]
+        
+        weak_percentage = (weak_count / total_tissue_pixels * 100) if total_tissue_pixels > 0 else 0.0
+        plain_percentage = (plain_count / total_tissue_pixels * 100) if total_tissue_pixels > 0 else 0.0
+        strong_percentage = (strong_count / total_tissue_pixels * 100) if total_tissue_pixels > 0 else 0.0
+        positive_percentage = (total_positive / total_tissue_pixels * 100) if total_tissue_pixels > 0 else 0.0
+        
+        # End timing
+        end_time = time.time()
+        execution_time = end_time - start_time
+        cpu_end = _get_cpu_metrics()
+        
+        params = {
+            "hue_value": hue_value,
+            "hue_width": hue_width,
+            "saturation_minimum": saturation_minimum,
+            "intensity_upper_limit": intensity_upper_limit,
+            "intensity_weak_threshold": intensity_weak_threshold,
+            "intensity_strong_threshold": intensity_strong_threshold,
+            "intensity_lower_limit": intensity_lower_limit,
+        }
+        if extra_params:
+            params.update(extra_params)
+        
+        return {
+            "item_id": item_id,
+            "total_pixels": total_pixels,
+            "tissue_pixels": total_tissue_pixels,
+            "background_pixels": int(np.sum(background_mask)),
+            "weak_positive_pixels": weak_count,
+            "plain_positive_pixels": plain_count,
+            "strong_positive_pixels": strong_count,
+            "total_positive_pixels": total_positive,
+            "weak_percentage": round(weak_percentage, 2),
+            "plain_percentage": round(plain_percentage, 2),
+            "strong_percentage": round(strong_percentage, 2),
+            "positive_percentage": round(positive_percentage, 2),
+            "method": "hsi",
+            "parameters": params,
+            "metrics": {
+                "execution_time_seconds": round(execution_time, 4),
+                "cpu_percent": round(cpu_end.get("cpu_percent", 0.0), 1),
+                "memory_mb": round(cpu_end.get("memory_mb", 0.0), 1),
+            }
+        }
+    except Exception as e:
+        logger.error(f"PPC HSI analysis failed for {item_id}: {e}", exc_info=True)
+        raise
 
 
 @memory.cache
@@ -305,9 +440,26 @@ def _compute_ppc_hsi_cached(
             }
         
         # Classify positive pixels into weak, plain, strong based on intensity
-        # Weak: intensity >= intensity_weak_threshold (lighter staining)
-        # Strong: intensity < intensity_strong_threshold (darker staining)
-        # Plain: intensity_strong_threshold <= intensity < intensity_weak_threshold (medium staining)
+        # 
+        # IMPORTANT: In HSI color space, "intensity" refers to pixel BRIGHTNESS (0=dark, 1=bright).
+        # This is the opposite of "staining intensity"!
+        #
+        # For IHC staining (DAB/brown):
+        #   - Strong staining = lots of DAB = dark brown = LOW pixel intensity (closer to 0)
+        #   - Weak staining = little DAB = light brown = HIGH pixel intensity (closer to 1)
+        #   - Negative = white background = VERY HIGH pixel intensity (close to 1)
+        #
+        # Examples:
+        #   - Intensity < 0.05 = very dark pixels = strongest/darkest staining
+        #   - Intensity < 0.3 = dark brown = strong staining
+        #   - Intensity 0.3-0.6 = medium brown = plain staining
+        #   - Intensity >= 0.6 = light brown = weak staining
+        #   - Intensity > 0.9 = white/background = negative
+        #
+        # Classification:
+        #   Weak: intensity >= intensity_weak_threshold (light brown, high pixel brightness)
+        #   Strong: intensity < intensity_strong_threshold (dark brown, low pixel brightness)
+        #   Plain: intensity_strong_threshold <= intensity < intensity_weak_threshold (medium brown)
         mask_weak = positive_intensities >= intensity_weak_threshold
         mask_strong = positive_intensities < intensity_strong_threshold
         mask_plain = ~(mask_weak | mask_strong)
@@ -565,6 +717,8 @@ def _compute_color_histogram_cached(item_id: str, width: int, token: str, bins: 
     Internal cached function to compute color histogram.
     Token is part of cache key to handle different authentication contexts.
     """
+    # Import here to avoid circular dependency
+    from app.services.image_fetching import _fetch_thumbnail_uncached
     img = _fetch_thumbnail_uncached(item_id, width, token)
     if img is None:
         raise ValueError(f"Failed to retrieve thumbnail for item {item_id}")
@@ -871,15 +1025,39 @@ def auto_detect_hue_parameters(
             }
         }
     
-    # Find dominant hue (for brown/DAB, typically around 0.05-0.15 in normalized HSI)
-    # Use histogram to find peak
-    hist, bins = np.histogram(h_valid, bins=180)  # 180 bins = 2 degrees per bin
+    # Prefer "brown-ish" pixels when auto-detecting hue.
+    # Without this, slides with strong hematoxylin can make the dominant hue skew blue.
+    # We compute a simple brownness score using RGB (high R, low B), and bias the hue
+    # histogram toward those pixels.
+    rgb_tissue = img[tissue_mask]
+    rgb_valid = rgb_tissue[valid_mask]
+    h_candidates = h_valid
+    if rgb_valid.size > 0:
+        # Score: red dominance + low blue
+        # (empirically stable for DAB-like brown vs hematoxylin blue)
+        r = rgb_valid[:, 0]
+        g = rgb_valid[:, 1]
+        b = rgb_valid[:, 2]
+        brown_score = (r - b) + 0.5 * (r - g)
+        # Use the top 30% most "brown" pixels, if we have enough samples
+        score_thresh = np.percentile(brown_score, 70)
+        brown_mask = brown_score >= score_thresh
+        if np.count_nonzero(brown_mask) >= 250:
+            h_candidates = h_valid[brown_mask]
+
+    # If possible, restrict to the expected DAB/brown hue band (roughly 0-90 degrees).
+    # If the band is empty (e.g., unusual stain), fall back to all candidates.
+    hue_band_mask = (h_candidates >= 0.0) & (h_candidates <= 0.25)
+    h_for_hist = h_candidates[hue_band_mask] if np.count_nonzero(hue_band_mask) >= 50 else h_candidates
+
+    # Find dominant hue using histogram peak
+    hist, bins = np.histogram(h_for_hist, bins=180)  # 180 bins = 2 degrees per bin
     peak_idx = np.argmax(hist)
     hue_value = float((bins[peak_idx] + bins[peak_idx + 1]) / 2.0)
     
     # Calculate hue width based on distribution
     # Use interquartile range (IQR) to determine width
-    q25, q75 = np.percentile(h_valid, [25, 75])
+    q25, q75 = np.percentile(h_for_hist, [25, 75])
     hue_width = float((q75 - q25) * 2.0)  # 2x IQR for reasonable coverage
     hue_width = np.clip(hue_width, 0.05, 0.3)  # Clamp to reasonable range
     
@@ -1000,6 +1178,78 @@ def compute_ppc(
             red_threshold,
             thumbnail_width
         )
+
+
+def compute_ppc_region(
+    item_id: str,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    output_width: int = 1024,
+    method: str = "hsi",
+    # HSI parameters
+    hue_value: float = 0.1,
+    hue_width: float = 0.1,
+    saturation_minimum: float = 0.1,
+    intensity_upper_limit: float = 0.9,
+    intensity_weak_threshold: float = 0.6,
+    intensity_strong_threshold: float = 0.3,
+    intensity_lower_limit: float = 0.05,
+    dsa_client: Optional[DSAClient] = None
+) -> Dict[str, Any]:
+    """
+    Compute Positive Pixel Count (PPC) for a specific region of an image.
+    
+    Similar to compute_ppc but works on a cropped region instead of the full thumbnail.
+    This allows analyzing specific areas at higher magnification or different FOV.
+    
+    The analysis logic is identical to thumbnail analysis - only the image fetch differs.
+    
+    Args:
+        item_id: DSA item ID
+        x: Left edge of region (0-1, normalized)
+        y: Top edge of region (0-1, normalized)
+        width: Width of region (0-1, normalized)
+        height: Height of region (0-1, normalized)
+        output_width: Output image width in pixels
+        method: "hsi" (only HSI method supported now)
+        hue_value: Center hue for positive color (0-1)
+        hue_width: Width of hue range (0-1)
+        saturation_minimum: Minimum saturation (0-1)
+        intensity_upper_limit: Intensity above which pixel is negative (0-1)
+        intensity_weak_threshold: Intensity threshold for weak vs plain (0-1)
+        intensity_strong_threshold: Intensity threshold for plain vs strong (0-1)
+        intensity_lower_limit: Intensity below which pixel is negative (0-1)
+        dsa_client: Optional DSA client instance
+    
+    Returns:
+        Dictionary with PPC results for the region
+    """
+    if dsa_client is None:
+        dsa_client = get_dsa_client()
+    
+    # Get region image (only difference from thumbnail path)
+    img = get_region_image(item_id, x, y, width, height, output_width, dsa_client)
+    if img is None:
+        raise ValueError(f"Failed to retrieve region for item {item_id}")
+    
+    # Use common analysis function - identical code path to thumbnail analysis
+    return _analyze_ppc_hsi(
+        img=img,
+        item_id=item_id,
+        hue_value=hue_value,
+        hue_width=hue_width,
+        saturation_minimum=saturation_minimum,
+        intensity_upper_limit=intensity_upper_limit,
+        intensity_weak_threshold=intensity_weak_threshold,
+        intensity_strong_threshold=intensity_strong_threshold,
+        intensity_lower_limit=intensity_lower_limit,
+        extra_params={
+            "output_width": output_width,
+            "region": {"x": x, "y": y, "width": width, "height": height}
+        }
+    )
 
 
 def get_ppc_label_image(
@@ -1228,6 +1478,134 @@ def _get_positive_pixel_intensities_cached(
     except Exception as e:
         logger.error(f"Failed to get positive pixel intensities for {item_id}: {e}", exc_info=True)
         raise
+
+
+def get_ppc_label_image_region(
+    item_id: str,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    output_width: int = 1024,
+    method: str = "hsi",
+    # HSI parameters
+    hue_value: float = 0.1,
+    hue_width: float = 0.1,
+    saturation_minimum: float = 0.1,
+    intensity_upper_limit: float = 0.9,
+    intensity_weak_threshold: float = 0.6,
+    intensity_strong_threshold: float = 0.3,
+    intensity_lower_limit: float = 0.05,
+    dsa_client: Optional[DSAClient] = None
+) -> Optional[np.ndarray]:
+    """
+    Generate label image for HSI-based PPC visualization on a region.
+    
+    Similar to get_ppc_label_image but works on a cropped region.
+    
+    Returns a label image where:
+    - 0 = negative (background or non-positive tissue)
+    - 1 = weak positive
+    - 2 = plain positive  
+    - 3 = strong positive
+    
+    Args:
+        item_id: DSA item ID
+        x: Left edge of region (0-1, normalized)
+        y: Top edge of region (0-1, normalized)
+        width: Width of region (0-1, normalized)
+        height: Height of region (0-1, normalized)
+        output_width: Output image width in pixels
+        method: "hsi" (only HSI method supports label images currently)
+        ... (HSI parameters)
+        dsa_client: Optional DSA client instance
+    
+    Returns:
+        Label image as numpy array (uint8), or None if method doesn't support it
+    """
+    if method != "hsi":
+        return None
+    
+    if dsa_client is None:
+        dsa_client = get_dsa_client()
+    
+    img = get_region_image(item_id, x, y, width, height, output_width, dsa_client)
+    if img is None:
+        return None
+    
+    # Convert to RGB if needed
+    if len(img.shape) == 2:
+        img = np.stack([img, img, img], axis=-1)
+    elif img.shape[2] == 4:
+        img = img[:, :, :3]
+    
+    # Normalize to 0-1 range
+    if img.dtype == np.uint8:
+        img = (img.astype(np.float32) / 255.0)
+    else:
+        img = img.astype(np.float32)
+    img = np.clip(img, 0.0, 1.0)
+    
+    # Convert RGB to HSI
+    hsi = rgb_to_hsi(img)
+    h, s, i = hsi[..., 0], hsi[..., 1], hsi[..., 2]
+    
+    # Background mask
+    background_threshold = 0.94
+    background_mask = (img[..., 0] > background_threshold) & \
+                      (img[..., 1] > background_threshold) & \
+                      (img[..., 2] > background_threshold)
+    tissue_mask = ~background_mask
+    
+    # Apply tissue mask to HSI channels
+    h_tissue = h[tissue_mask]
+    s_tissue = s[tissue_mask]
+    i_tissue = i[tissue_mask]
+    
+    if len(h_tissue) == 0:
+        # No tissue, return all zeros
+        return np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+    
+    # Positive pixel detection
+    hue_diff = ((h_tissue - hue_value + 0.5) % 1.0) - 0.5
+    hue_in_range = np.abs(hue_diff) <= (hue_width / 2.0)
+    saturation_ok = s_tissue >= saturation_minimum
+    intensity_ok = (i_tissue < intensity_upper_limit) & (i_tissue >= intensity_lower_limit)
+    mask_all_positive = hue_in_range & saturation_ok & intensity_ok
+    
+    # Get intensities of positive pixels
+    positive_intensities = i_tissue[mask_all_positive]
+    
+    if len(positive_intensities) == 0:
+        # No positive pixels, return all zeros
+        return np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+    
+    # Classify positive pixels by intensity
+    mask_weak = positive_intensities >= intensity_weak_threshold
+    mask_strong = positive_intensities < intensity_strong_threshold
+    mask_plain = ~(mask_weak | mask_strong)
+    
+    # Create label image (0=negative, 1=weak, 2=plain, 3=strong)
+    label_image = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+    
+    # Get tissue pixel indices
+    tissue_indices = np.where(tissue_mask)
+    positive_tissue_indices = np.where(mask_all_positive)[0]
+    
+    # Map positive pixels to label values
+    weak_indices = positive_tissue_indices[mask_weak]
+    plain_indices = positive_tissue_indices[mask_plain]
+    strong_indices = positive_tissue_indices[mask_strong]
+    
+    # Set label values
+    for idx in weak_indices:
+        label_image[tissue_indices[0][idx], tissue_indices[1][idx]] = 1
+    for idx in plain_indices:
+        label_image[tissue_indices[0][idx], tissue_indices[1][idx]] = 2
+    for idx in strong_indices:
+        label_image[tissue_indices[0][idx], tissue_indices[1][idx]] = 3
+    
+    return label_image
 
 
 def get_positive_pixel_intensities(
