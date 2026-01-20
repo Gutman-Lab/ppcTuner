@@ -1,6 +1,5 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
-import { PpcLabelOverlay } from './PpcLabelOverlay'
 import { SlideViewerSection } from './SlideViewerSection'
 import { HistogramSection } from './HistogramSection'
 import { ParameterSetsPanel } from './ParameterSetsPanel'
@@ -11,7 +10,7 @@ import { CapturedRegionPanel } from './CapturedRegionPanel'
 import { PpcResults } from './PpcResults'
 import { AutoComputeControls } from './AutoComputeControls'
 import { useLocalStorage } from '../hooks/useLocalStorage'
-import type { SavedParameterSet, PpcResult, CapturedRegion } from '../types'
+import type { SavedParameterSet, PpcResult, CapturedRegion, RoiHueSampleReport } from '../types'
 import type { Item } from 'bdsa-react-components'
 
 interface ImageViewerSectionProps {
@@ -138,6 +137,20 @@ export function ImageViewerSection({
     'ppcTuner_ppcPanelCollapsed',
     false
   )
+
+  // ROI sampling report + optional viewer overlay of sampled squares
+  const [roiHueReport, setRoiHueReport] = useState<RoiHueSampleReport | null>(null)
+  const [showSampledRois, setShowSampledRois] = useState(false)
+  const [roiSamplingMode, setRoiSamplingMode] = useLocalStorage<'dab_biased' | 'stratified'>(
+    'ppcTuner_roiSamplingMode',
+    'dab_biased'
+  )
+
+  // Reset ROI sampling state when the slide changes (sampling is slide-specific).
+  useEffect(() => {
+    setRoiHueReport(null)
+    setShowSampledRois(false)
+  }, [itemId])
   
   // Automatically enable PPC label overlay when PPC data becomes available
   // This ensures the overlay appears after computing PPC (replacing the old thumbnail panel behavior)
@@ -179,6 +192,17 @@ export function ImageViewerSection({
                 />
                 Show Tissue Mask
               </label>
+              {(roiHueReport?.rois?.length || roiHueReport?.debug_rois?.length) ? (
+                <label style={{ fontSize: '0.875rem', color: '#333', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={showSampledRois}
+                    onChange={(e) => setShowSampledRois(e.target.checked)}
+                    style={{ cursor: 'pointer' }}
+                  />
+                  Show Sampled ROIs
+                </label>
+              ) : null}
               {ppcData?.method === 'hsi' && (
                 <label style={{ fontSize: '0.875rem', color: '#333', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                   <input
@@ -234,31 +258,13 @@ export function ImageViewerSection({
             intensityStrongThreshold={intensityStrongThreshold}
             intensityLowerLimit={intensityLowerLimit}
             showTissueMask={showTissueMask}
+            setShowTissueMask={setShowTissueMask}
             histogramData={histogramData}
+            sampledRois={roiHueReport?.rois ?? []}
+            sampledRoiDebug={roiHueReport?.debug_rois ?? []}
+            showSampledRois={showSampledRois}
+            setShowSampledRois={setShowSampledRois}
           />
-          {/* Saved Parameter Set Overlays */}
-          {savedParameterSets
-            // Never apply saved overlays to a different slide
-            .filter(set => set.visible && (!set.itemId || set.itemId === itemId))
-            .map((set) => (
-              <PpcLabelOverlay
-                key={set.id}
-                itemId={itemId}
-                method="hsi"
-                opacity={ppcLabelOpacity * 0.7}
-                showWeak={showWeak}
-                showPlain={showPlain}
-                showStrong={showStrong}
-                colorScheme={labelColorScheme}
-                hueValue={set.hueValue}
-                hueWidth={set.hueWidth}
-                saturationMinimum={set.saturationMinimum}
-                intensityUpperLimit={set.intensityUpperLimit}
-                intensityWeakThreshold={set.intensityWeakThreshold}
-                intensityStrongThreshold={set.intensityStrongThreshold}
-                intensityLowerLimit={set.intensityLowerLimit}
-              />
-            ))}
 
           {/* Parameter Sets - moved below viewer to free vertical space above */}
           <div style={{ marginTop: '1rem' }}>
@@ -435,6 +441,11 @@ export function ImageViewerSection({
                     setIntensityWeakThreshold={setIntensityWeakThreshold}
                     setIntensityStrongThreshold={setIntensityStrongThreshold}
                     setIntensityLowerLimit={setIntensityLowerLimit}
+                    roiHueReport={roiHueReport}
+                    setRoiHueReport={setRoiHueReport}
+                    onAfterRoiSample={() => setShowSampledRois(true)}
+                    roiSamplingMode={roiSamplingMode}
+                    setRoiSamplingMode={setRoiSamplingMode}
                   />
 
                   <AutoComputeControls

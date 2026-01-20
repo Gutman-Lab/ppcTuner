@@ -2,13 +2,12 @@ import { useCallback, useState, useEffect, useMemo } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { SlideViewer } from 'bdsa-react-components'
 import type { SlideViewerProps } from 'bdsa-react-components'
-import { TissueMaskOverlay } from './TissueMaskOverlay'
 import { safeJsonParse } from '../utils/api'
 
 // OverlayTileSource is exported from SlideViewer but not from main package export
 // Import it from the component's types
 type OverlayTileSource = NonNullable<SlideViewerProps['overlayTileSources']>[number]
-import type { PpcResult, SavedParameterSet, CapturedRegion } from '../types'
+import type { PpcResult, SavedParameterSet, CapturedRegion, RoiHueSample, RoiHueSampleDebug } from '../types'
 
 interface SlideViewerSectionProps {
   itemId: string
@@ -43,7 +42,13 @@ interface SlideViewerSectionProps {
   intensityLowerLimit: number
   // Tissue mask
   showTissueMask: boolean
+  setShowTissueMask: (show: boolean) => void
   histogramData: any
+  // ROI sampling overlay (debug/validation)
+  sampledRois: RoiHueSample[]
+  sampledRoiDebug?: RoiHueSampleDebug[]
+  showSampledRois: boolean
+  setShowSampledRois: (show: boolean) => void
 }
 
 export function SlideViewerSection({
@@ -73,11 +78,19 @@ export function SlideViewerSection({
   intensityStrongThreshold,
   intensityLowerLimit,
   showTissueMask,
+  setShowTissueMask,
   histogramData,
+  sampledRois,
+  sampledRoiDebug,
+  showSampledRois,
+  setShowSampledRois,
 }: SlideViewerSectionProps) {
   // State for base64 data URLs (OpenSeadragon needs base64 data URLs for regular images in overlays)
   const [ppcLabelImageDataUrl, setPpcLabelImageDataUrl] = useState<string | null>(null)
+  const [savedOverlayDataUrls, setSavedOverlayDataUrls] = useState<Record<string, string | null>>({})
+  const [tissueMaskDataUrl, setTissueMaskDataUrl] = useState<string | null>(null)
   const [isCapturingRegion, setIsCapturingRegion] = useState(false)
+  const [slideLoadError, setSlideLoadError] = useState<string | null>(null)
   
   // Build PPC label image URLs (served via backend proxy - more efficient than base64)
   // The overlayTileSources prop accepts image URLs directly
@@ -148,11 +161,194 @@ export function SlideViewerSection({
         setPpcLabelImageDataUrl(null)
       })
   }, [ppcLabelImageUrl])
+
+  // Fetch and convert tissue mask to base64 data URL so it can be added as an OSD overlay.
+  useEffect(() => {
+    if (!showTissueMask) {
+      setTissueMaskDataUrl(null)
+      return
+    }
+    const backgroundThreshold = histogramData?.tissue_analysis?.background_threshold ?? 240
+    const maskUrl = `/api/images/${itemId}/mask?width=2048&background_threshold=${backgroundThreshold}`
+
+    let cancelled = false
+    fetch(maskUrl)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Failed to load mask: ${response.status}`)
+        return response.blob()
+      })
+      .then((blob) => {
+        const reader = new FileReader()
+        reader.onloadend = () => {
+          if (!cancelled) setTissueMaskDataUrl(reader.result as string)
+        }
+        reader.onerror = () => {
+          console.error('Error converting tissue mask to base64')
+          if (!cancelled) setTissueMaskDataUrl(null)
+        }
+        reader.readAsDataURL(blob)
+      })
+      .catch((e) => {
+        console.error('Error loading tissue mask overlay:', e)
+        if (!cancelled) setTissueMaskDataUrl(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [showTissueMask, itemId, histogramData])
+
+  // Fetch and cache saved parameter-set overlays (full-image overlays)
+  useEffect(() => {
+    const visibleSets = savedParameterSets.filter((s) => s.visible && (!s.itemId || s.itemId === itemId))
+    if (visibleSets.length === 0) {
+      // Nothing visible; avoid setState churn (which can cause render loops).
+      // If we already have cached overlays, drop them to prevent memory bloat.
+      setSavedOverlayDataUrls((prev) => {
+        if (Object.keys(prev).length === 0) return prev
+        return {}
+      })
+      return
+    }
+
+    let cancelled = false
+    const toFetch = visibleSets.filter((s) => !savedOverlayDataUrls[s.id])
+    if (toFetch.length === 0) return () => { cancelled = true }
+
+    ;(async () => {
+      for (const s of toFetch) {
+        try {
+          const params = new URLSearchParams({
+            item_id: itemId,
+            method: 'hsi',
+            thumbnail_width: '2048',
+            hue_value: s.hueValue.toString(),
+            hue_width: s.hueWidth.toString(),
+            saturation_minimum: s.saturationMinimum.toString(),
+            intensity_upper_limit: s.intensityUpperLimit.toString(),
+            intensity_weak_threshold: s.intensityWeakThreshold.toString(),
+            intensity_strong_threshold: s.intensityStrongThreshold.toString(),
+            intensity_lower_limit: s.intensityLowerLimit.toString(),
+            show_weak: showWeak.toString(),
+            show_plain: showPlain.toString(),
+            show_strong: showStrong.toString(),
+            color_scheme: labelColorScheme,
+          })
+
+          const url = `/api/ppc/label-image?${params.toString()}`
+          const response = await fetch(url)
+          if (!response.ok) throw new Error(`Failed to load saved overlay: ${response.status}`)
+          const blob = await response.blob()
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onloadend = () => resolve(reader.result as string)
+            reader.onerror = () => reject(new Error('Failed to convert saved overlay to base64'))
+            reader.readAsDataURL(blob)
+          })
+
+          if (cancelled) return
+          setSavedOverlayDataUrls((prev) => ({ ...prev, [s.id]: dataUrl }))
+        } catch (e) {
+          // Don’t spam alerts; log once and keep going
+          console.error('Failed to load saved overlay:', s.id, e)
+          if (cancelled) return
+          setSavedOverlayDataUrls((prev) => ({ ...prev, [s.id]: null }))
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [savedParameterSets, itemId, savedOverlayDataUrls, showWeak, showPlain, showStrong, labelColorScheme])
   
   
-  // Combine all overlays (PPC overlays + multiple region overlays)
+  const sampledRoiOverlays = useMemo(() => {
+    if (!showSampledRois) return [] as OverlayTileSource[]
+
+    const debug = sampledRoiDebug?.length ? sampledRoiDebug : null
+    const accepted: Array<{ x: number, y: number, width: number, height: number }> =
+      sampledRois.map((r) => ({ x: r.x, y: r.y, width: r.width, height: r.height }))
+
+    const items: Array<{ status: 'accepted' | 'rejected', label: string, color: string, x: number, y: number, width: number, height: number }> = []
+
+    if (debug) {
+      let okIdx = 0
+      let badIdx = 0
+      for (const d of debug) {
+        const color = d.status === 'accepted' ? '#00c853' : '#f44336'
+        const idx = d.status === 'accepted' ? (++okIdx) : (++badIdx)
+        const reasonKey = d.status === 'rejected' ? (d.reason ?? 'rejected') : 'ok'
+        const shortReason =
+          reasonKey === 'dab_band_fraction_thumb' ? 'strong_dab' :
+          reasonKey === 'tissue_fraction' ? 'tissue' :
+          reasonKey === 'too_close' ? 'close' :
+          reasonKey === 'region_fetch_failed' ? 'fetch' :
+          reasonKey === 'likely_negative_no_dab' ? 'neg' :
+          String(reasonKey)
+
+        const dabFrac = typeof d.dab_band_fraction_thumb === 'number' ? d.dab_band_fraction_thumb : null
+        const label = d.status === 'accepted'
+          ? `OK ${idx}`
+          : `BAD ${idx}: ${shortReason}${dabFrac != null && shortReason === 'strong_dab' ? ` ${(dabFrac * 100).toFixed(1)}%` : ''}`
+        items.push({ status: d.status, label, color, x: d.x, y: d.y, width: d.width, height: d.height })
+      }
+    } else {
+      const colors = ['#ff00aa', '#00bcd4', '#ff9800', '#8bc34a', '#673ab7', '#e91e63', '#03a9f4']
+      accepted.forEach((r, idx) => {
+        items.push({
+          status: 'accepted',
+          label: `ROI ${idx + 1}`,
+          color: colors[idx % colors.length],
+          ...r,
+        })
+      })
+    }
+
+    if (items.length === 0) return [] as OverlayTileSource[]
+
+    const makeSvgDataUrl = (label: string, color: string) => {
+      const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="2" y="2" width="96" height="96" fill="none" stroke="${color}" stroke-width="4"/>
+  <rect x="2" y="2" width="96" height="20" fill="rgba(255,255,255,0.85)"/>
+  <text x="6" y="16" font-family="Arial, sans-serif" font-size="12" fill="${color}" font-weight="700">${label}</text>
+</svg>`
+      return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+    }
+
+    return items.map((r, idx) => {
+      return {
+        id: `roi-sampled-${idx + 1}-${r.status}`,
+        tileSource: makeSvgDataUrl(r.label, r.color),
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+        opacity: 1.0,
+      }
+    })
+  }, [sampledRois, sampledRoiDebug, showSampledRois])
+
+  // Combine all overlays (PPC overlays + multiple region overlays + sampled ROI boxes)
   const overlayTileSources = useMemo(() => {
     const overlays: OverlayTileSource[] = []
+
+    if (showTissueMask && tissueMaskDataUrl) {
+      overlays.push({
+        id: 'tissue-mask',
+        tileSource: tissueMaskDataUrl,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        opacity: 0.45,
+      })
+    }
+
+    for (const o of sampledRoiOverlays) {
+      overlays.push(o)
+    }
 
     if (showPpcLabel && ppcLabelImageDataUrl) {
       overlays.push({
@@ -180,8 +376,24 @@ export function SlideViewerSection({
       })
     }
 
+    for (const s of savedParameterSets) {
+      if (!s.visible) continue
+      if (s.itemId && s.itemId !== itemId) continue
+      const tileSource = savedOverlayDataUrls[s.id]
+      if (!tileSource) continue
+      overlays.push({
+        id: `ppc-label-saved-${s.id}`,
+        tileSource,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        opacity: ppcLabelOpacity * 0.7,
+      })
+    }
+
     return overlays
-  }, [showPpcLabel, ppcLabelImageDataUrl, ppcLabelOpacity, capturedRegions])
+  }, [showTissueMask, tissueMaskDataUrl, sampledRoiOverlays, showPpcLabel, ppcLabelImageDataUrl, ppcLabelOpacity, capturedRegions, savedParameterSets, savedOverlayDataUrls, itemId])
   
   // Memoize fetchFn for SlideViewer to ensure proper authentication
   // Always provide fetchFn (even if no token) to ensure it's used for all requests
@@ -212,23 +424,24 @@ export function SlideViewerSection({
         }
       }
       
-      console.log('SlideViewer fetch:', finalUrl)
-      console.log('SlideViewer has token:', !!dsaToken)
-      console.log('SlideViewer headers:', headers)
-      
       const response = await fetch(finalUrl, {
         ...options,
         headers,
       })
       
-      console.log('SlideViewer response status:', response.status, 'for', finalUrl)
-      
-      if (!response.ok && response.status === 401) {
-        console.error('SlideViewer 401 Unauthorized - token may be invalid or expired')
-        console.error('Request URL:', finalUrl)
-        console.error('Request headers:', headers)
-        const errorText = await response.clone().text()
-        console.error('Error response:', errorText.substring(0, 200))
+      // Capture common failure modes so we don't end up with a silent black viewer.
+      // (OSD can fail quietly depending on where the request fails.)
+      if (!response.ok) {
+        const isTilesRequest = finalUrl.includes('/tiles/')
+        if (isTilesRequest) {
+          const msg = `Slide load failed (${response.status})${response.status === 401 ? ' — token/auth?' : ''}`
+          setSlideLoadError((prev) => prev ?? msg)
+        }
+      } else {
+        // Clear any previous error once we get a successful tiles request.
+        if (finalUrl.includes('/tiles/')) {
+          setSlideLoadError(null)
+        }
       }
       
       return response
@@ -239,8 +452,34 @@ export function SlideViewerSection({
   return (
     <div style={{ position: 'relative', display: 'inline-block', width: '100%' }}>
       <div style={{ width: '100%', height, position: 'relative' }}>
+        {slideLoadError && (
+          <div
+            style={{
+              position: 'absolute',
+              left: '10px',
+              bottom: '10px',
+              zIndex: 1000,
+              background: 'rgba(255,255,255,0.95)',
+              border: '1px solid #f5a623',
+              borderRadius: '6px',
+              padding: '0.4rem 0.6rem',
+              fontSize: '0.75rem',
+              color: '#333',
+              maxWidth: '420px',
+              boxShadow: '0 2px 6px rgba(0,0,0,0.12)',
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: '0.15rem' }}>Viewer warning</div>
+            <div>{slideLoadError}</div>
+            {!dsaToken && (
+              <div style={{ marginTop: '0.25rem', color: '#666' }}>
+                No token in frontend; if your DSA requires auth, tiles will 401.
+              </div>
+            )}
+          </div>
+        )}
         <SlideViewer
-          key={`${itemId}-${dsaToken ? 'auth' : 'noauth'}-overlays-${showPpcLabel ? '1' : '0'}-regions-${capturedRegions.filter(r => r.showOverlayOnMain).length}`} // Force re-render when overlay visibility changes to prevent ghost overlays
+          key={`${itemId}-${dsaToken ? 'auth' : 'noauth'}-overlays-${showPpcLabel ? '1' : '0'}-mask-${showTissueMask ? '1' : '0'}-rois-${showSampledRois ? '1' : '0'}-${(sampledRoiDebug?.length ?? sampledRois.length)}-regions-${capturedRegions.filter(r => r.showOverlayOnMain).length}`} // Force re-render when overlay visibility changes to prevent ghost overlays
           imageInfo={{
             dziUrl: dsaToken 
               ? `${apiBaseUrl}/item/${itemId}/tiles/dzi.dzi?token=${dsaToken}`
@@ -327,9 +566,14 @@ export function SlideViewerSection({
                 return
               }
               
-              console.log('Captured viewport region (normalized 0-1):', clampedRegion)
-              console.log('Region coordinates - X:', clampedRegion.x.toFixed(6), 'Y:', clampedRegion.y.toFixed(6), 
-                         'W:', clampedRegion.width.toFixed(6), 'H:', clampedRegion.height.toFixed(6))
+              // Keep this log concise; it's useful when debugging overlay alignment issues.
+              console.log(
+                'Captured region:',
+                `x=${clampedRegion.x.toFixed(4)}`,
+                `y=${clampedRegion.y.toFixed(4)}`,
+                `w=${clampedRegion.width.toFixed(4)}`,
+                `h=${clampedRegion.height.toFixed(4)}`
+              )
               
               const regionId = `region-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
               const createdAt = Date.now()
@@ -498,6 +742,48 @@ export function SlideViewerSection({
               </div>
             )}
 
+            {showTissueMask && !!tissueMaskDataUrl && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ color: '#333' }}>Tissue Mask</div>
+                <button
+                  onClick={() => setShowTissueMask(false)}
+                  style={{
+                    padding: '0.15rem 0.5rem',
+                    fontSize: '0.7rem',
+                    backgroundColor: '#f44336',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                  }}
+                  title="Remove tissue mask overlay"
+                >
+                  Remove
+                </button>
+              </div>
+            )}
+
+            {showSampledRois && sampledRois.length > 0 && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ color: '#333' }}>Sampled ROIs</div>
+                <button
+                  onClick={() => setShowSampledRois(false)}
+                  style={{
+                    padding: '0.15rem 0.5rem',
+                    fontSize: '0.7rem',
+                    backgroundColor: '#f44336',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                  }}
+                  title="Hide sampled ROI boxes"
+                >
+                  Remove
+                </button>
+              </div>
+            )}
+
             {capturedRegions
               .filter((r) => r.showOverlayOnMain && !!r.overlayDataUrl)
               .map((r, idx) => (
@@ -560,6 +846,8 @@ export function SlideViewerSection({
               ))}
 
             {!(
+              (showTissueMask && !!tissueMaskDataUrl) ||
+              (showSampledRois && sampledRois.length > 0) ||
               (showPpcLabel && !!ppcLabelImageDataUrl) ||
               capturedRegions.some((r) => r.showOverlayOnMain && !!r.overlayDataUrl) ||
               savedParameterSets.some((s) => s.visible && (!s.itemId || s.itemId === itemId))
@@ -567,12 +855,6 @@ export function SlideViewerSection({
           </div>
         </div>
       </div>
-      {showTissueMask && histogramData?.tissue_analysis && (
-        <TissueMaskOverlay 
-          itemId={itemId}
-          backgroundThreshold={histogramData.tissue_analysis.background_threshold || 240}
-        />
-      )}
     </div>
   )
 }

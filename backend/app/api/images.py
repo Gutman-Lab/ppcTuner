@@ -4,7 +4,6 @@ Image-related API endpoints
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from typing import Optional
-from pydantic import BaseModel
 import requests
 import logging
 from app.services.dsa_client import DSAClient
@@ -23,20 +22,6 @@ def get_dsa_client() -> DSAClient:
     if _dsa_client is None:
         _dsa_client = DSAClient()
     return _dsa_client
-
-
-class ImageInfo(BaseModel):
-    """Image information model"""
-    id: str
-    name: str
-    folder_id: Optional[str] = None
-
-
-@router.get("/")
-async def list_images(folder_id: Optional[str] = None):
-    """List images from DSA server"""
-    # TODO: Implement DSA client integration
-    return {"images": [], "folder_id": folder_id}
 
 
 @router.get("/{image_id}")

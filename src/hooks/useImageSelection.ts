@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { safeJsonParse } from '../utils/api'
 import type { Item } from 'bdsa-react-components'
@@ -37,6 +37,9 @@ export function useImageSelection({
   setCurrentViewport,
   autoDetectHue,
 }: UseImageSelectionProps) {
+  const didInitialRestoreRef = useRef(false)
+  const skipNextRestoreRef = useRef(false)
+
   // Fetch image dimensions when item changes
   useEffect(() => {
     const itemId = (selectedItem as any)?._id || (selectedItem as any)?.id
@@ -67,6 +70,8 @@ export function useImageSelection({
   // Handle thumbnail click - load histogram and auto-detect hue
   const handleThumbnailClick = useCallback(async (item: Item) => {
     console.log('Thumbnail clicked:', item)
+    // This is a user-driven change; don't let the "restore saved item" effect re-run for it.
+    skipNextRestoreRef.current = true
     setSelectedItem(item)
     setHistogramData(null)
     setPpcData(null) // Clear PPC data when new image is selected
@@ -115,7 +120,15 @@ export function useImageSelection({
 
   // Load histogram for saved item when config is loaded
   useEffect(() => {
-    if (configLoaded && selectedItem && dsaToken) {
+    if (!configLoaded || !selectedItem || !dsaToken) return
+    if (didInitialRestoreRef.current) return
+    if (skipNextRestoreRef.current) {
+      skipNextRestoreRef.current = false
+      return
+    }
+
+    didInitialRestoreRef.current = true
+    {
       const itemId = (selectedItem as any)._id || (selectedItem as any).id
       if (itemId) {
         console.log('🔄 Restoring saved item and loading histogram:', itemId)

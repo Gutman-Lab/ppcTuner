@@ -110,16 +110,8 @@ function App() {
     autoDetectHue,
   })
 
-  // Auto-detect hue parameters when a new region is captured
-  useEffect(() => {
-    if (capturedRegions.length > 0 && selectedItem) {
-      const itemId = (selectedItem as any)._id || (selectedItem as any).id
-      if (itemId) {
-        console.log('🔄 New region captured, auto-detecting hue parameters')
-        autoDetectHue(itemId)
-      }
-    }
-  }, [capturedRegions.length, selectedItem, autoDetectHue])
+  // Note: we intentionally auto-detect hue once per slide selection (not per-region),
+  // since ROI sampling showed it to be stable and re-detecting can be distracting.
 
   const handleResourceSelect = (resource: Resource) => {
     console.log('Resource selected:', resource)

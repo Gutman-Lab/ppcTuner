@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { safeJsonParse } from '../utils/api'
+import type { RoiHueSampleReport } from '../types'
 
 interface PpcParametersProps {
   itemId: string | null
@@ -17,6 +18,11 @@ interface PpcParametersProps {
   setIntensityWeakThreshold: (value: number) => void
   setIntensityStrongThreshold: (value: number) => void
   setIntensityLowerLimit: (value: number) => void
+  roiHueReport: RoiHueSampleReport | null
+  setRoiHueReport: (report: RoiHueSampleReport | null) => void
+  onAfterRoiSample?: () => void
+  roiSamplingMode: 'dab_biased' | 'stratified'
+  setRoiSamplingMode: (mode: 'dab_biased' | 'stratified') => void
 }
 
 export function PpcParameters({
@@ -35,8 +41,14 @@ export function PpcParameters({
   setIntensityWeakThreshold,
   setIntensityStrongThreshold,
   setIntensityLowerLimit,
+  roiHueReport,
+  setRoiHueReport,
+  onAfterRoiSample,
+  roiSamplingMode,
+  setRoiSamplingMode,
 }: PpcParametersProps) {
   const [showTooltip, setShowTooltip] = useState(false)
+  const [roiHueLoading, setRoiHueLoading] = useState(false)
   
   return (
     <div style={{ marginBottom: '1rem', padding: '0.75rem', backgroundColor: '#f9f9f9', borderRadius: '4px', fontSize: '0.875rem' }}>
@@ -248,6 +260,132 @@ export function PpcParameters({
       >
         Auto-detect Hue Parameters
       </button>
+
+      <button
+        onClick={async () => {
+          if (!itemId) return
+          setRoiHueLoading(true)
+          try {
+            const params = new URLSearchParams({
+              item_id: itemId,
+              n_rois: '5',
+              roi_fraction: '0.08',
+              roi_output_width: '1024',
+              min_tissue_fraction: '0.6',
+              min_dab_band_fraction: '0.01',
+              min_roi_separation: '0.072',
+              sampling_mode: roiSamplingMode,
+              max_candidates: '10',
+              thumbnail_width: '1024',
+            })
+            const response = await fetch(`/api/ppc/auto-detect-hue-sampled?${params.toString()}`)
+            if (response.ok) {
+              const data = await safeJsonParse(response)
+              setRoiHueReport(data as RoiHueSampleReport)
+              onAfterRoiSample?.()
+            } else {
+              const txt = await response.text()
+              console.error('ROI hue sampling failed:', response.status, txt)
+              alert(`ROI hue sampling failed: ${response.status}`)
+            }
+          } catch (error) {
+            console.error('Error sampling ROI hue:', error)
+            alert(`Error: ${error}`)
+          } finally {
+            setRoiHueLoading(false)
+          }
+        }}
+        disabled={!itemId || roiHueLoading}
+        style={{
+          marginTop: '0.5rem',
+          padding: '0.4rem 0.8rem',
+          fontSize: '0.8rem',
+          backgroundColor: roiHueLoading ? '#ccc' : '#6c5ce7',
+          color: 'white',
+          border: 'none',
+          borderRadius: '4px',
+          cursor: (!itemId || roiHueLoading) ? 'not-allowed' : 'pointer',
+          opacity: (!itemId || roiHueLoading) ? 0.6 : 1,
+          width: '100%'
+        }}
+      >
+        {roiHueLoading ? 'Sampling ROIs...' : 'Sample 5 ROIs (≈10x) + Compare'}
+      </button>
+
+      <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+        <label style={{ fontSize: '0.75rem', color: '#555', fontWeight: 600 }}>ROI sampling mode:</label>
+        <select
+          value={roiSamplingMode}
+          onChange={(e) => setRoiSamplingMode(e.target.value as 'dab_biased' | 'stratified')}
+          style={{
+            fontSize: '0.8rem',
+            padding: '0.25rem 0.4rem',
+            borderRadius: '6px',
+            border: '1px solid #ddd',
+            background: '#fff',
+          }}
+          title="Choose how the backend picks ROI locations"
+        >
+          <option value="dab_biased">DAB-biased (current)</option>
+          <option value="stratified">Stratified (spread across tissue)</option>
+        </select>
+      </div>
+
+      {roiHueReport?.summary && (
+        <div style={{ marginTop: '0.75rem', padding: '0.75rem', border: '1px solid #ddd', borderRadius: '6px', backgroundColor: '#fff' }}>
+          <div style={{ fontWeight: 700, marginBottom: '0.5rem', color: '#333' }}>ROI Hue Stability</div>
+          {(!roiHueReport.debug_rois || roiHueReport.debug_rois.length === 0) ? (
+            <div style={{ marginBottom: '0.5rem', fontSize: '0.75rem', color: '#a15c00' }}>
+              Note: no <code>debug_rois</code> returned, so the viewer can only draw accepted ROIs. If you expected BAD boxes too, restart the backend and re-run sampling.
+            </div>
+          ) : null}
+          {roiHueReport.summary.likely_negative ? (
+            <div style={{ marginBottom: '0.5rem', padding: '0.5rem', backgroundColor: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', color: '#6b5b00' }}>
+              <strong>Likely DAB-negative slide</strong> (baseline DAB-band frac≈{(roiHueReport.summary.baseline_dab_band_fraction ?? 0).toFixed?.(4) ?? roiHueReport.summary.baseline_dab_band_fraction}).<br />
+              ROI sampling will return <strong>debug candidates</strong> without doing expensive region fetches.
+            </div>
+          ) : null}
+          <div style={{ fontSize: '0.8rem', color: '#333', lineHeight: 1.5 }}>
+            <div style={{ fontSize: '0.75rem', color: '#666' }}>
+              <strong>Mode</strong>: {roiHueReport.summary.sampling_mode ?? 'unknown'}{' '}
+              | <strong>debug_rois</strong>: {roiHueReport.debug_rois?.length ?? 0}
+              {typeof roiHueReport.summary.max_candidates !== 'undefined' ? (
+                <> | <strong>max_candidates</strong>: {roiHueReport.summary.max_candidates}</>
+              ) : null}
+            </div>
+            {(typeof roiHueReport.summary.rejected_tissue !== 'undefined' ||
+              typeof roiHueReport.summary.rejected_dab !== 'undefined' ||
+              typeof roiHueReport.summary.rejected_too_close !== 'undefined' ||
+              typeof roiHueReport.summary.fetch_failures !== 'undefined') ? (
+              <div style={{ fontSize: '0.75rem', color: '#666' }}>
+                <strong>rejects</strong>:
+                {' '}tissue={roiHueReport.summary.rejected_tissue ?? 0},
+                {' '}strong_dab={roiHueReport.summary.rejected_dab ?? 0},
+                {' '}close={roiHueReport.summary.rejected_too_close ?? 0},
+                {' '}fetch={roiHueReport.summary.fetch_failures ?? 0}
+              </div>
+            ) : null}
+            <div>
+              <strong>Baseline (thumbnail)</strong>: H={roiHueReport.summary.baseline_hue_value} ({(roiHueReport.summary.baseline_hue_value * 360).toFixed(1)}°),
+              W={roiHueReport.summary.baseline_hue_width} ({(roiHueReport.summary.baseline_hue_width * 360).toFixed(1)}°)
+            </div>
+            <div>
+              <strong>ROIs</strong>: n={roiHueReport.summary.n_rois_computed}/{roiHueReport.summary.n_rois_requested},{' '}
+              frac={roiHueReport.summary.roi_fraction}, outW={roiHueReport.summary.roi_output_width}
+            </div>
+            <div>
+              <strong>Hue mean±std</strong>: {roiHueReport.summary.hue_value_mean?.toFixed?.(4) ?? roiHueReport.summary.hue_value_mean}
+              {' '}±{' '}
+              {roiHueReport.summary.hue_value_std?.toFixed?.(4) ?? roiHueReport.summary.hue_value_std}
+            </div>
+            <div>
+              <strong>Width mean±std</strong>: {roiHueReport.summary.hue_width_mean?.toFixed?.(4) ?? roiHueReport.summary.hue_width_mean}
+              {' '}±{' '}
+              {roiHueReport.summary.hue_width_std?.toFixed?.(4) ?? roiHueReport.summary.hue_width_std}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

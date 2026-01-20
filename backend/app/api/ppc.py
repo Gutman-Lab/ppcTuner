@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 import logging
-from app.services.ppc_service import compute_ppc, compute_ppc_region, auto_threshold_ppc, auto_detect_hue_parameters, get_ppc_label_image, get_ppc_label_image_region, get_positive_pixel_intensities, memory
+from app.services.ppc_service import compute_ppc, compute_ppc_region, auto_threshold_ppc, auto_detect_hue_parameters, auto_detect_hue_parameters_sampled_rois, get_ppc_label_image, get_ppc_label_image_region, get_positive_pixel_intensities, memory
 from fastapi.responses import Response
 from app.core.config import settings
 
@@ -223,6 +223,47 @@ async def auto_detect_hue(
     except Exception as e:
         logger.error(f"Auto-detect hue failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Auto-detect hue failed: {str(e)}")
+
+
+@router.get("/auto-detect-hue-sampled")
+async def auto_detect_hue_sampled(
+    item_id: str = Query(..., description="DSA item ID"),
+    n_rois: int = Query(5, ge=1, le=25, description="Number of ROIs to sample"),
+    roi_fraction: float = Query(0.08, ge=0.01, le=0.5, description="Normalized ROI width/height (0-1)"),
+    roi_output_width: int = Query(1024, ge=256, le=4096, description="Output pixel width for each ROI"),
+    min_tissue_fraction: float = Query(0.6, ge=0.0, le=0.99, description="Minimum tissue fraction inside sampled ROI square (0-1)"),
+    min_dab_band_fraction: float = Query(0.01, ge=0.0, le=0.99, description="Minimum fraction of valid pixels within expected DAB hue band (0-1)"),
+    negative_dab_fraction_threshold: float = Query(0.005, ge=0.0, le=0.5, description="If baseline DAB-band fraction is below this, treat slide as likely-negative and return debug candidates without region fetches"),
+    min_roi_separation: Optional[float] = Query(None, ge=0.0, le=1.0, description="Minimum separation (normalized) between accepted ROI centers (defaults to ~roi_fraction)"),
+    sampling_mode: str = Query("dab_biased", description="ROI sampling mode: 'dab_biased' or 'stratified'"),
+    max_candidates: int = Query(10, ge=1, le=200, description="Max candidate ROIs to fully evaluate (for bounded runtime + debugging)"),
+    thumbnail_width: int = Query(1024, ge=256, le=4096, description="Thumbnail width for baseline + tissue sampling")
+):
+    """
+    Sample multiple tissue ROIs and auto-detect hue parameters per ROI.
+    Useful to assess stability of hue/hue_width across the slide vs thumbnail-level baseline.
+    """
+    try:
+        result = auto_detect_hue_parameters_sampled_rois(
+            item_id=item_id,
+            n_rois=n_rois,
+            roi_fraction=roi_fraction,
+            roi_output_width=roi_output_width,
+            min_tissue_fraction=min_tissue_fraction,
+            min_dab_band_fraction=min_dab_band_fraction,
+            negative_dab_fraction_threshold=negative_dab_fraction_threshold,
+            min_roi_separation=min_roi_separation,
+            sampling_mode=sampling_mode,
+            max_candidates=max_candidates,
+            thumbnail_width=thumbnail_width
+        )
+        return result
+    except ValueError as e:
+        logger.error(f"Auto-detect hue sampled error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Auto-detect hue sampled failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Auto-detect hue sampled failed: {str(e)}")
 
 
 @router.get("/label-image", response_class=Response)

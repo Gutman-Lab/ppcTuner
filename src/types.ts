@@ -77,6 +77,43 @@ export interface CapturedRegion {
   overlayDataUrl?: string | null // cached data URL for main viewer overlay (optional)
 }
 
+export interface RoiHueSample {
+  x: number
+  y: number
+  width: number
+  height: number
+  output_width: number
+  tissue_fraction?: number
+  dab_band_fraction?: number
+  dab_band_fraction_thumb?: number
+  hue_value: number
+  hue_width: number
+}
+
+export interface RoiHueSampleDebug {
+  status: 'accepted' | 'rejected'
+  reason?: 'tissue_fraction' | 'dab_band_fraction_thumb' | 'region_fetch_failed' | 'likely_negative_no_dab' | 'too_close' | null
+  x: number
+  y: number
+  width: number
+  height: number
+  tissue_fraction?: number | null
+  dab_band_fraction_thumb?: number | null
+  dab_band_fraction?: number | null
+  output_width?: number
+  hue_value?: number
+  hue_width?: number
+}
+
+export interface RoiHueSampleReport {
+  item_id: string
+  baseline: Record<string, any>
+  rois: RoiHueSample[]
+  debug_rois?: RoiHueSampleDebug[]
+  summary: Record<string, any>
+  metrics?: Record<string, any>
+}
+
 export interface SavedParameterSet {
   id: string
   name: string
