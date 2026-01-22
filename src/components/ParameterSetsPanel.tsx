@@ -3,9 +3,9 @@ import type { SavedParameterSet, PpcResult } from '../types'
 
 interface ParameterSetsPanelProps {
   savedParameterSets: SavedParameterSet[]
-  setSavedParameterSets: (sets: SavedParameterSet[]) => void
+  setSavedParameterSets: React.Dispatch<React.SetStateAction<SavedParameterSet[]>>
   nextSetId: number
-  setNextSetId: (id: number) => void
+  setNextSetId: React.Dispatch<React.SetStateAction<number>>
   ppcData: PpcResult | null
   itemId: string
   itemName?: string
