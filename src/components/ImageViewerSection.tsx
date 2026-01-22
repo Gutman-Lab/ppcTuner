@@ -70,9 +70,9 @@ interface ImageViewerSectionProps {
   setAutoCompute: (enabled: boolean) => void
   // Parameter sets
   savedParameterSets: SavedParameterSet[]
-  setSavedParameterSets: (sets: SavedParameterSet[]) => void
+  setSavedParameterSets: Dispatch<SetStateAction<SavedParameterSet[]>>
   nextSetId: number
-  setNextSetId: (id: number) => void
+  setNextSetId: Dispatch<SetStateAction<number>>
   // Auto-detect hue
   autoDetectHue: (itemId: string) => Promise<void>
 }

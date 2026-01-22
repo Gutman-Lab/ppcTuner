@@ -31,7 +31,7 @@ interface SlideViewerSectionProps {
   labelColorScheme: string
   // Saved parameter set overlays
   savedParameterSets: SavedParameterSet[]
-  setSavedParameterSets: (sets: SavedParameterSet[]) => void
+  setSavedParameterSets: Dispatch<SetStateAction<SavedParameterSet[]>>
   // HSI parameters
   hueValue: number
   hueWidth: number
